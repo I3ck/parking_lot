@@ -15,10 +15,12 @@ use stable::{AtomicU8, Ordering};
 type U8 = usize;
 use std::thread;
 use parking_lot::{self, UnparkResult};
+use poison::Poison;
 use SPIN_LIMIT;
 
 const LOCKED_BIT: U8 = 1;
 const PARKED_BIT: U8 = 2;
+const POISON_BIT: U8 = 4;
 
 pub struct RawMutex {
     state: AtomicU8,
@@ -37,40 +39,46 @@ impl RawMutex {
     }
 
     #[inline]
-    pub fn lock(&self) {
+    pub fn lock(&self) -> Poison {
         if self.state
             .compare_exchange_weak(0, LOCKED_BIT, Ordering::Acquire, Ordering::Relaxed)
             .is_ok() {
-            return;
+            return Poison(false);
         }
-        self.lock_slow();
+        self.lock_slow()
     }
 
     #[inline]
-    pub fn try_lock(&self) -> bool {
+    pub fn try_lock(&self) -> Option<Poison> {
         let mut state = self.state.load(Ordering::Relaxed);
         loop {
             if state & LOCKED_BIT != 0 {
-                return false;
+                return None;
             }
             match self.state.compare_exchange_weak(state,
                                                    state | LOCKED_BIT,
                                                    Ordering::Acquire,
                                                    Ordering::Relaxed) {
-                Ok(_) => return true,
+                Ok(_) => return Some(Poison(state & POISON_BIT != 0)),
                 Err(x) => state = x,
             }
         }
     }
 
     #[inline]
-    pub fn unlock(&self) {
-        if self.state
+    pub fn unlock(&self, poison: Poison) {
+        if !poison.0 &&
+           self.state
             .compare_exchange_weak(LOCKED_BIT, 0, Ordering::Release, Ordering::Relaxed)
             .is_ok() {
             return;
         }
-        self.unlock_slow();
+        self.unlock_slow(poison);
+    }
+
+    #[inline]
+    pub fn is_poisoned(&self) -> Poison {
+        Poison(self.state.load(Ordering::Relaxed) & POISON_BIT != 0)
     }
 
     // Used by Condvar when requeuing threads to us, must be called while
@@ -101,7 +109,7 @@ impl RawMutex {
 
     #[cold]
     #[inline(never)]
-    fn lock_slow(&self) {
+    fn lock_slow(&self) -> Poison {
         let mut spin_count = 0;
         let mut state = self.state.load(Ordering::Relaxed);
         loop {
@@ -112,7 +120,7 @@ impl RawMutex {
                                            state | LOCKED_BIT,
                                            Ordering::Acquire,
                                            Ordering::Relaxed) {
-                    Ok(_) => return,
+                    Ok(_) => return Poison(state & POISON_BIT != 0),
                     Err(x) => state = x,
                 }
                 continue;
@@ -141,7 +149,8 @@ impl RawMutex {
             unsafe {
                 let addr = self as *const _ as usize;
                 let validate = &mut || {
-                    self.state.load(Ordering::Relaxed) == LOCKED_BIT | PARKED_BIT
+                    self.state.load(Ordering::Relaxed) & (LOCKED_BIT | PARKED_BIT) ==
+                    LOCKED_BIT | PARKED_BIT
                 };
                 let before_sleep = &mut || {};
                 let timed_out = &mut |_, _| unreachable!();
@@ -155,13 +164,22 @@ impl RawMutex {
 
     #[cold]
     #[inline(never)]
-    fn unlock_slow(&self) {
+    fn unlock_slow(&self, poison: Poison) {
         let mut state = self.state.load(Ordering::Relaxed);
         loop {
+            let poison_bit = if poison.0 {
+                POISON_BIT
+            } else {
+                state & POISON_BIT
+            };
+
             // Unlock directly if there are no parked threads
             if state & PARKED_BIT == 0 {
                 match self.state
-                    .compare_exchange_weak(LOCKED_BIT, 0, Ordering::Release, Ordering::Relaxed) {
+                    .compare_exchange_weak(state,
+                                           poison_bit,
+                                           Ordering::Release,
+                                           Ordering::Relaxed) {
                     Ok(_) => return,
                     Err(x) => state = x,
                 }
@@ -174,9 +192,9 @@ impl RawMutex {
                 let addr = self as *const _ as usize;
                 let callback = &mut |result| {
                     if result == UnparkResult::UnparkedNotLast {
-                        self.state.store(PARKED_BIT, Ordering::Release);
+                        self.state.store(PARKED_BIT | poison_bit, Ordering::Release);
                     } else {
-                        self.state.store(0, Ordering::Release);
+                        self.state.store(poison_bit, Ordering::Release);
                     }
                 };
                 parking_lot::unpark_one(addr, callback);
